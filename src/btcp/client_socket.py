@@ -49,6 +49,11 @@ class BTCPClientSocket(BTCPSocket):
         # thread into the network thread. Bounded in size.
         self._sendbuf = queue.Queue(maxsize=1000)
         self._state = BTCPStates.CLOSED 
+        # Current sequence number, acknowledgement number, and queue of unconfirmed (not ack'd) packets
+        self._curseq = 1
+        self._expected_ack = 0
+        self._unconfirmed = queue.Queue()
+        self._shutdownable = False
         logger.info("Socket initialized with sendbuf size 1000")
 
 
@@ -104,6 +109,7 @@ class BTCPClientSocket(BTCPSocket):
         each elif.
         """
         logger.debug("lossy_layer_segment_received called")
+        logger.info("Received segment.")
         match self._state:
             case BTCPStates.SYN_SENT:
                 # If I receive segment from server
@@ -113,11 +119,21 @@ class BTCPClientSocket(BTCPSocket):
                 pass
             case BTCPStates.ESTABLISHED:
                 # If I receive segment from server
-                ## Check if segment contains ACK flag
-                ## Check if ACK number is last-sent SYN number and in-order (Maybe using Queue?)
-                ### If it is, send data with next SYN
-                ## If it does not contain ACK flag or contains invalid ACK number 
-                pass
+                (seqnum, acknum, syn_set, ack_set, fin_set, 
+                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+                logger.warning(f"----------------------------------------")
+                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
+                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+                logger.warning(f"window size {window} and length {length}")
+                logger.warning(f"----------------------------------------")
+                ## Check if ACK set
+                if ack_set == 1:
+                    ## Check if ACK number is next-up SYN number and in-order (Maybe using Queue?)
+                    if acknum == self._expected_ack:
+                        self._unconfirmed.get_nowait()
+                        logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after rcv")
+                        self._shutdownable = True
+                ## If it does not contain ACK flag or contains invalid ACK number ??? 
             case BTCPStates.FIN_SENT:
                 # If I receive segment from server
                 ## Check if segment contains FIN and ACK flag
@@ -125,7 +141,7 @@ class BTCPClientSocket(BTCPSocket):
                 ## Check if segment contains ACK but no FIN (?)
                 ### If it does, register ACK
                 pass
-        raise NotImplementedError("No implementation of lossy_layer_segment_received present. Read the comments & code of client_socket.py.")
+        # raise NotImplementedError("No implementation of lossy_layer_segment_received present. Read the comments & code of client_socket.py.")
 
 
     def lossy_layer_tick(self):
@@ -168,32 +184,42 @@ class BTCPClientSocket(BTCPSocket):
                 ## If yes
                 ### Move to BTCPStates.CLOSED
                 pass
+            case BTCPStates.ESTABLISHED:
+                # Actually send all chunks available for sending.
+                # Relies on an eventual exception to break from the loop when no data
+                # is available.
+                # You should be checking whether there's space in the window as well,
+                # and storing the segments for retransmission somewhere.
+                try:
+                    # while True:
+                    logger.debug("Getting chunk from buffer.")
+                    self._shutdownable = False
+                    chunk = self._sendbuf.get_nowait()
+                    logger.warning(f"{self._sendbuf.qsize()} chunks left in buffer")
+                    datalen = len(chunk)
+                    logger.debug("Got chunk with length %i:",
+                                    datalen)
+                    logger.debug(chunk)
+                    if datalen < PAYLOAD_SIZE:
+                        logger.debug("Padding chunk to full size")
+                        chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
+                    logger.debug("Building segment from chunk.")
+                    segment = (self.build_segment_header(seqnum=self._curseq, acknum=0, length=datalen)
+                                + chunk)
+                    logger.info("Sending segment.")
+                    logger.warning(f"----------------------------------------")
+                    logger.warning(f"Trying to send Segment with seq#{self._curseq}")
+                    logger.warning(f"and payload {chunk}")
+                    logger.warning(f"----------------------------------------") 
+                    self._expected_ack = self._curseq + datalen
+                    self._curseq = self._expected_ack
+                    self._unconfirmed.put_nowait(segment)
+                    self._lossy_layer.send_segment(segment)
+                    logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after send")
+                except queue.Empty:
+                    logger.info("No (more) data was available for sending right now.")
             # Maybe more to be added
-        raise NotImplementedError("Only rudimentary implementation of lossy_layer_tick present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
-
-        # Actually send all chunks available for sending.
-        # Relies on an eventual exception to break from the loop when no data
-        # is available.
-        # You should be checking whether there's space in the window as well,
-        # and storing the segments for retransmission somewhere.
-        try:
-            while True:
-                logger.debug("Getting chunk from buffer.")
-                chunk = self._sendbuf.get_nowait()
-                datalen = len(chunk)
-                logger.debug("Got chunk with lenght %i:",
-                             datalen)
-                logger.debug(chunk)
-                if datalen < PAYLOAD_SIZE:
-                    logger.debug("Padding chunk to full size")
-                    chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
-                logger.debug("Building segment from chunk.")
-                segment = (self.build_segment_header(0, 0, length=datalen)
-                           + chunk)
-                logger.info("Sending segment.")
-                self._lossy_layer.send_segment(segment)
-        except queue.Empty:
-            logger.info("No (more) data was available for sending right now.")
+        # raise NotImplementedError("Only rudimentary implementation of lossy_layer_tick present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
 
 
 
@@ -247,7 +273,8 @@ class BTCPClientSocket(BTCPSocket):
         this project.
         """
         logger.debug("connect called")
-        raise NotImplementedError("No implementation of connect present. Read the comments & code of client_socket.py.")
+        self._state = BTCPStates.ESTABLISHED
+        # raise NotImplementedError("No implementation of connect present. Read the comments & code of client_socket.py.")
 
 
     def send(self, data):
@@ -278,7 +305,7 @@ class BTCPClientSocket(BTCPSocket):
         done later.
         """
         logger.debug("send called")
-        raise NotImplementedError("Only rudimentary implementation of send present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
+        # raise NotImplementedError("Only rudimentary implementation of send present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
 
         # Example with a finite buffer: a queue with at most 1000 chunks,
         # for a maximum of 985KiB data buffered to get turned into packets.
@@ -320,7 +347,15 @@ class BTCPClientSocket(BTCPSocket):
         more advanced thread synchronization in this project.
         """
         logger.debug("shutdown called")
-        raise NotImplementedError("No implementation of shutdown present. Read the comments & code of client_socket.py.")
+        while True:
+            # Check if both queues are empty
+            if self._unconfirmed.empty() and self._sendbuf.empty() and self._shutdownable:
+                logger.warning(f"ON SHUTDOWN: {self._unconfirmed.qsize()} segments unconfirmed")
+                logger.warning(f"ON SHUTDOWN: {self._sendbuf.qsize()} chunks left to send")
+                break
+            # If not, continue to wait
+            continue
+        # raise NotImplementedError("No implementation of shutdown present. Read the comments & code of client_socket.py.")
 
 
     def close(self):

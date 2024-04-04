@@ -64,6 +64,8 @@ class BTCPServerSocket(BTCPSocket):
         self._example_timer = None
         # Set default state
         self._state = BTCPStates.CLOSED
+        # Last received
+        self._lastack = None
 
 
     ###########################################################################
@@ -125,7 +127,7 @@ class BTCPServerSocket(BTCPSocket):
         """
         logger.debug("lossy_layer_segment_received called")
         logger.debug(segment)
-        # raise NotImplementedError("Only rudimentary implementation of lossy_layer_segment_received present. Read the comments & code of server_socket.py, then remove the NotImplementedError.")
+        # #raise NotImplementedError("Only rudimentary implementation of lossy_layer_segment_received present. Read the comments & code of server_socket.py, then remove the NotImplementedError.")
 
         # match ... case is available since Python 3.10
         # Note, this is *not* the same as a "switch" statement from other
@@ -208,12 +210,56 @@ class BTCPServerSocket(BTCPSocket):
                 ## Move to ESTABLISHED
                 pass
             case BTCPStates.ESTABLISHED:
-                # Check if segment seq. number is previous ACK+1
-                ## If yes, send ACK
+                (seqnum, acknum, syn_set, ack_set, fin_set, 
+                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+                logger.warning(f"----------------------------------------")
+                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
+                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+                logger.warning(f"window size {window} and length {length}")
+                logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
+                logger.warning(f"----------------------------------------")
+                logger.warning(f"seqnum {seqnum} | _lastack {self._lastack}")
+                # If no previous ack yet (first packet) then set to seqnum+length
+                if self._lastack == None:
+                    self._lastack = seqnum + length
+                    logger.warning(f"----------------------------------------")
+                    logger.warning(f"Trying to send return Segment with ack#{seqnum+length}")
+                    logger.warning(f"----------------------------------------") 
+                    return_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+length, length=0, ack_set=True)
+                    self._lossy_layer.send_segment(return_segment)
+                # Check if segment seq. number is previous ACK
+                if seqnum == self._lastack:
+                    ## If yes, send ACK
+                    self._lastack = seqnum + length
+                    logger.warning(f"----------------------------------------")
+                    logger.warning(f"Trying to send return Segment with ack#{seqnum+length}")
+                    logger.warning(f"----------------------------------------") 
+                    return_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+length, length=0, ack_set=True)
+                    self._lossy_layer.send_segment(return_segment)                  
                 ## If no, do nothing (? maybe some other error handling here)
+
                 # Check if FIN received
                 ## Send FIN|ACK
-                pass
+
+                # Get length from header. Change this to a proper segment header unpack
+                # after implementing BTCPSocket.unpack_segment_header in btcp_socket.py
+                # datalen, = struct.unpack("!H", segment[6:8])
+                ## Updated with proper unpack
+                # Slice data from incoming segment.
+                chunk = segment[HEADER_SIZE:HEADER_SIZE + length]
+                # Pass data into receive buffer so that the application thread can
+                # retrieve it.
+                try:
+                    self._recvbuf.put_nowait(chunk)
+                except queue.Full:
+                    # Data gets dropped if the receive buffer is full. You need to
+                    # ensure this doesn't happen by using window sizes and not
+                    # acknowledging dropped data.
+                    # Initially, while still developing other features,
+                    # you can also just set the size limitation on the Queue
+                    # much higher, or remove it altogether.
+                    logger.critical("Data got dropped!")
+                    logger.debug(chunk)
             case BTCPStates.ACCEPTING:
                 # Check if SYN received
                 ## Send SYN|ACK and move to SYN_RCVD
@@ -256,7 +302,7 @@ class BTCPServerSocket(BTCPSocket):
                 pass
         self._start_example_timer()
         self._expire_timers()
-        raise NotImplementedError("No implementation of lossy_layer_tick present. Read the comments & code of server_socket.py.")
+        #raise NotImplementedError("No implementation of lossy_layer_tick present. Read the comments & code of server_socket.py.")
 
 
     # The following two functions show you how you could implement a (fairly
@@ -337,7 +383,8 @@ class BTCPServerSocket(BTCPSocket):
         this project.
         """
         logger.debug("accept called")
-        raise NotImplementedError("No implementation of accept present. Read the comments & code of server_socket.py.")
+        self._state = BTCPStates.ESTABLISHED
+        #raise NotImplementedError("No implementation of accept present. Read the comments & code of server_socket.py.")
 
 
     def recv(self):
@@ -372,7 +419,7 @@ class BTCPServerSocket(BTCPSocket):
         Again, you should feel free to deviate from how this usually works.
         """
         logger.debug("recv called")
-        raise NotImplementedError("Only rudimentary implementation of recv present. Read the comments & code of server_socket.py, then remove the NotImplementedError.")
+        #raise NotImplementedError("Only rudimentary implementation of recv present. Read the comments & code of server_socket.py, then remove the NotImplementedError.")
 
         # Rudimentary example implementation:
         # Empty the queue in a loop, reading into a larger bytearray object.

@@ -1,7 +1,7 @@
 import struct
 import logging
 from enum import IntEnum
-from constants import *
+from btcp.constants import *
 
 
 logger = logging.getLogger(__name__)
