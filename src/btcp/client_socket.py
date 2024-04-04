@@ -50,10 +50,12 @@ class BTCPClientSocket(BTCPSocket):
         self._sendbuf = queue.Queue(maxsize=1000)
         self._state = BTCPStates.CLOSED 
         # Current sequence number, acknowledgement number, and queue of unconfirmed (not ack'd) packets
-        self._curseq = 1
+        self._curseqnum = 1
         self._expected_ack = 0
         self._unconfirmed = queue.Queue()
+
         self._shutdownable = False
+        self._closable = False
         logger.info("Socket initialized with sendbuf size 1000")
 
 
@@ -136,9 +138,23 @@ class BTCPClientSocket(BTCPSocket):
                 ## If it does not contain ACK flag or contains invalid ACK number ??? 
             case BTCPStates.FIN_SENT:
                 # If I receive segment from server
+                (seqnum, acknum, syn_set, ack_set, fin_set, 
+                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+                logger.warning(f"----------------------------------------")
+                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
+                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+                logger.warning(f"window size {window} and length {length}")
+                logger.warning(f"----------------------------------------")
                 ## Check if segment contains FIN and ACK flag
-                ### If it does, send ACK and move to BTCPStates.CLOSED
+                if fin_set == 1 and ack_set == 1:
+                    ### If it does, send ACK and move to BTCPStates.CLOSED
+                    final_ack_segment = self.build_segment_header(seqnum=self._curseqnum, acknum=0, ack_set=True)
+                    self._lossy_layer.send_segment(final_ack_segment)
+                    self._closable = True
                 ## Check if segment contains ACK but no FIN (?)
+                elif fin_set == 0 and ack_set == 1:
+                    # Handle resend :DDDDD
+                    pass
                 ### If it does, register ACK
                 pass
         # raise NotImplementedError("No implementation of lossy_layer_segment_received present. Read the comments & code of client_socket.py.")
@@ -204,15 +220,21 @@ class BTCPClientSocket(BTCPSocket):
                         logger.debug("Padding chunk to full size")
                         chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
                     logger.debug("Building segment from chunk.")
-                    segment = (self.build_segment_header(seqnum=self._curseq, acknum=0, length=datalen)
+                    pre_cksm_segment = (self.build_segment_header(seqnum=self._curseqnum, 
+                                                         acknum=0, length=datalen, checksum=0x0000)
                                 + chunk)
+                    internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
+                    segment = (self.build_segment_header(seqnum=self._curseqnum, 
+                                                         acknum=0, length=datalen, checksum=internet_checksum)
+                                + chunk)
+                    logger.warning(f"==== Client internet checksum {internet_checksum}")
                     logger.info("Sending segment.")
                     logger.warning(f"----------------------------------------")
-                    logger.warning(f"Trying to send Segment with seq#{self._curseq}")
+                    logger.warning(f"Trying to send Segment with seq#{self._curseqnum}")
                     logger.warning(f"and payload {chunk}")
                     logger.warning(f"----------------------------------------") 
-                    self._expected_ack = self._curseq + datalen
-                    self._curseq = self._expected_ack
+                    self._expected_ack = self._curseqnum + datalen
+                    self._curseqnum = self._expected_ack
                     self._unconfirmed.put_nowait(segment)
                     self._lossy_layer.send_segment(segment)
                     logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after send")
@@ -350,8 +372,20 @@ class BTCPClientSocket(BTCPSocket):
         while True:
             # Check if both queues are empty
             if self._unconfirmed.empty() and self._sendbuf.empty() and self._shutdownable:
-                logger.warning(f"ON SHUTDOWN: {self._unconfirmed.qsize()} segments unconfirmed")
-                logger.warning(f"ON SHUTDOWN: {self._sendbuf.qsize()} chunks left to send")
+                # logger.warning(f"ON SHUTDOWN: {self._unconfirmed.qsize()} segments unconfirmed")
+                # logger.warning(f"ON SHUTDOWN: {self._sendbuf.qsize()} chunks left to send")
+                # Send FIN
+                fin_segment = BTCPSocket.build_segment_header(seqnum=self._curseqnum, acknum=0, fin_set=True)
+                self._lossy_layer.send_segment(fin_segment)
+                self._state = BTCPStates.FIN_SENT
+                # Receive FIN/ACK
+                # Send ACK
+                # _closable = True
+                # Block waiting for _closable
+                while True:
+                    if self._closable:
+                        break
+                    continue
                 break
             # If not, continue to wait
             continue

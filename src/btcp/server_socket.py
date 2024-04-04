@@ -190,8 +190,16 @@ class BTCPServerSocket(BTCPSocket):
         """
         logger.debug("_closing_segment_received called")
         logger.info("Segment received in CLOSING state.")
-        logger.info("This needs to be properly implemented. "
-                    "Currently only here for demonstration purposes.")
+        # logger.info("This needs to be properly implemented. "
+                    # "Currently only here for demonstration purposes.")
+        (seqnum, acknum, syn_set, ack_set, fin_set, 
+        window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+        logger.warning(f"----------------------------------------")
+        logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
+        logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+        logger.warning(f"window size {window} and length {length}")
+        logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
+        logger.warning(f"----------------------------------------")
 
 
     def _other_segment_received(self, segment):
@@ -219,6 +227,23 @@ class BTCPServerSocket(BTCPSocket):
                 logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
                 logger.warning(f"----------------------------------------")
                 logger.warning(f"seqnum {seqnum} | _lastack {self._lastack}")
+                data_chunk = segment[HEADER_SIZE:SEGMENT_SIZE]
+                cksm_segment = (self.build_segment_header(seqnum=seqnum, acknum=acknum, 
+                                                          syn_set=True if syn_set == 1 else False,
+                                                          ack_set=True if ack_set == 1 else False,
+                                                          fin_set=True if fin_set == 1 else False,
+                                                          window=window, length=length, checksum=0x0000)
+                                + data_chunk)
+                # logger.warning(segment)
+                expected_checksum = BTCPSocket.in_cksum(cksm_segment)
+                logger.warning(f"==== Client internet checksum {checksum}")
+                logger.warning(f"==== Expected internet checksum {expected_checksum}")
+                logger.warning(f"==== Correct checksum? {expected_checksum == checksum}")
+                if fin_set == 1:
+                    fin_ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum, ack_set=True, fin_set=True)
+                    self._lossy_layer.send_segment(fin_ack_segment)
+                    self._state = BTCPStates.CLOSING
+                    return
                 # If no previous ack yet (first packet) then set to seqnum+length
                 if self._lastack == None:
                     self._lastack = seqnum + length
