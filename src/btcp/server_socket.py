@@ -6,6 +6,7 @@ import queue
 import time
 import struct
 import logging
+import random
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,9 @@ class BTCPServerSocket(BTCPSocket):
         self._state = BTCPStates.CLOSED
         # Last received
         self._lastack = None
+
+        self._accepted = False
+        self._synchronized = False
 
 
     ###########################################################################
@@ -156,31 +160,32 @@ class BTCPServerSocket(BTCPSocket):
 
 
     def _closed_segment_received(self, segment):
-        """Helper method handling received segment in CLOSED state
-        """
-        logger.debug("_closed_segment_received called")
-        logger.warning("Segment received in CLOSED state.")
-        logger.warning("Normally we wouldn't process this, but the "
-                       "rudimentary implementation never leaves the CLOSED "
-                       "state.")
-        # Get length from header. Change this to a proper segment header unpack
-        # after implementing BTCPSocket.unpack_segment_header in btcp_socket.py
-        datalen, = struct.unpack("!H", segment[6:8])
-        # Slice data from incoming segment.
-        chunk = segment[HEADER_SIZE:HEADER_SIZE + datalen]
-        # Pass data into receive buffer so that the application thread can
-        # retrieve it.
-        try:
-            self._recvbuf.put_nowait(chunk)
-        except queue.Full:
-            # Data gets dropped if the receive buffer is full. You need to
-            # ensure this doesn't happen by using window sizes and not
-            # acknowledging dropped data.
-            # Initially, while still developing other features,
-            # you can also just set the size limitation on the Queue
-            # much higher, or remove it altogether.
-            logger.critical("Data got dropped!")
-            logger.debug(chunk)
+        pass
+        # """Helper method handling received segment in CLOSED state
+        # """
+        # logger.debug("_closed_segment_received called")
+        # logger.warning("Segment received in CLOSED state.")
+        # logger.warning("Normally we wouldn't process this, but the "
+        #                "rudimentary implementation never leaves the CLOSED "
+        #                "state.")
+        # # Get length from header. Change this to a proper segment header unpack
+        # # after implementing BTCPSocket.unpack_segment_header in btcp_socket.py
+        # datalen, = struct.unpack("!H", segment[6:8])
+        # # Slice data from incoming segment.
+        # chunk = segment[HEADER_SIZE:HEADER_SIZE + datalen]
+        # # Pass data into receive buffer so that the application thread can
+        # # retrieve it.
+        # try:
+        #     self._recvbuf.put_nowait(chunk)
+        # except queue.Full:
+        #     # Data gets dropped if the receive buffer is full. You need to
+        #     # ensure this doesn't happen by using window sizes and not
+        #     # acknowledging dropped data.
+        #     # Initially, while still developing other features,
+        #     # you can also just set the size limitation on the Queue
+        #     # much higher, or remove it altogether.
+        #     logger.critical("Data got dropped!")
+        #     logger.debug(chunk)
 
 
     def _closing_segment_received(self, segment):
@@ -211,10 +216,38 @@ class BTCPServerSocket(BTCPSocket):
         logger.info("Segment received in %s state",
                     self._state)
         match self._state:
+            case BTCPStates.ACCEPTING:
+                # Check if SYN received
+                (seqnum, acknum, syn_set, ack_set, fin_set, 
+                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+                logger.warning(f"----------------------------------------")
+                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
+                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+                logger.warning(f"window size {window} and length {length}")
+                logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
+                logger.warning(f"----------------------------------------")
+                ## [PROBLEM] Checksum check here to be implemented :DD
+                ## Send SYN|ACK and move to SYN_RCVD
+                seqnum_y = random.randint(0, 65535)
+                syn_ack_segment = self.build_segment_header(seqnum=seqnum_y, acknum=seqnum+1, 
+                                                            syn_set=True, ack_set=True)
+                self._lossy_layer.send_segment(syn_ack_segment)
+                self._state = BTCPStates.SYN_RCVD
+                pass
             case BTCPStates.SYN_RCVD:
+                (seqnum, acknum, syn_set, ack_set, fin_set, 
+                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+                logger.warning(f"----------------------------------------")
+                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
+                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+                logger.warning(f"window size {window} and length {length}")
+                logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
+                logger.warning(f"----------------------------------------")
                 # Check if SYN received OR timeout
                 ## Re-send SYN|ACK
-                # Check if ACK received
+                # Check if ACK received (and correct ACK, not done here)
+                if ack_set == 1:
+                    self._state = BTCPStates.ESTABLISHED
                 ## Move to ESTABLISHED
                 pass
             case BTCPStates.ESTABLISHED:
@@ -239,6 +272,8 @@ class BTCPServerSocket(BTCPSocket):
                 logger.warning(f"==== Client internet checksum {checksum}")
                 logger.warning(f"==== Expected internet checksum {expected_checksum}")
                 logger.warning(f"==== Correct checksum? {expected_checksum == checksum}")
+                ###### [PROBLEM] THIS CODE IS IN THE WRONG PLACE DDD: NOT FOR ESTABLISHED, FOR CLOSING !!!!
+                # [PROBLEM] also need to implement checksums for fin segments
                 if fin_set == 1:
                     fin_ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum, ack_set=True, fin_set=True)
                     self._lossy_layer.send_segment(fin_ack_segment)
@@ -285,10 +320,6 @@ class BTCPServerSocket(BTCPSocket):
                     # much higher, or remove it altogether.
                     logger.critical("Data got dropped!")
                     logger.debug(chunk)
-            case BTCPStates.ACCEPTING:
-                # Check if SYN received
-                ## Send SYN|ACK and move to SYN_RCVD
-                pass
 
 
     def lossy_layer_tick(self):
@@ -408,7 +439,12 @@ class BTCPServerSocket(BTCPSocket):
         this project.
         """
         logger.debug("accept called")
-        self._state = BTCPStates.ESTABLISHED
+        self._state = BTCPStates.ACCEPTING
+        while True:
+            # Block waiting for _accepted (recv SYN and send SYN|ACK)
+            if self._accepted:
+                break
+            continue
         #raise NotImplementedError("No implementation of accept present. Read the comments & code of server_socket.py.")
 
 

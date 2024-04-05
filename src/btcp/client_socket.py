@@ -4,6 +4,7 @@ from btcp.constants import *
 
 import queue
 import logging
+import random
 
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ class BTCPClientSocket(BTCPSocket):
         self._sendbuf = queue.Queue(maxsize=1000)
         self._state = BTCPStates.CLOSED 
         # Current sequence number, acknowledgement number, and queue of unconfirmed (not ack'd) packets
-        self._curseqnum = 1
+        self._cur_seq_num = 1
         self._expected_ack = 0
         self._unconfirmed = queue.Queue()
 
@@ -114,9 +115,21 @@ class BTCPClientSocket(BTCPSocket):
         logger.info("Received segment.")
         match self._state:
             case BTCPStates.SYN_SENT:
-                # If I receive segment from server
+                (seqnum, acknum, syn_set, ack_set, fin_set, 
+                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+                logger.warning(f"----------------------------------------")
+                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
+                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+                logger.warning(f"window size {window} and length {length}")
+                logger.warning(f"----------------------------------------")
                 ## Check if segment contains SYN and ACK flag
-                ## Check if ACK number is 0 (or 1? not sure how the numbering works yet)
+                if syn_set == 1 and ack_set == 1:
+                    if acknum == self._expected_ack:
+                        ## Check if ACK number is as expected
+                        ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+1, ack_set=True)
+                        self._lossy_layer.send_segment(ack_segment)
+                        self._cur_seq_num = acknum
+                        self._state = BTCPStates.ESTABLISHED
                 ### If it is, send back ACK 
                 pass
             case BTCPStates.ESTABLISHED:
@@ -148,7 +161,7 @@ class BTCPClientSocket(BTCPSocket):
                 ## Check if segment contains FIN and ACK flag
                 if fin_set == 1 and ack_set == 1:
                     ### If it does, send ACK and move to BTCPStates.CLOSED
-                    final_ack_segment = self.build_segment_header(seqnum=self._curseqnum, acknum=0, ack_set=True)
+                    final_ack_segment = self.build_segment_header(seqnum=self._cur_seq_num, acknum=0, ack_set=True)
                     self._lossy_layer.send_segment(final_ack_segment)
                     self._closable = True
                 ## Check if segment contains ACK but no FIN (?)
@@ -220,21 +233,21 @@ class BTCPClientSocket(BTCPSocket):
                         logger.debug("Padding chunk to full size")
                         chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
                     logger.debug("Building segment from chunk.")
-                    pre_cksm_segment = (self.build_segment_header(seqnum=self._curseqnum, 
+                    pre_cksm_segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
                                                          acknum=0, length=datalen, checksum=0x0000)
                                 + chunk)
                     internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
-                    segment = (self.build_segment_header(seqnum=self._curseqnum, 
+                    segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
                                                          acknum=0, length=datalen, checksum=internet_checksum)
                                 + chunk)
                     logger.warning(f"==== Client internet checksum {internet_checksum}")
                     logger.info("Sending segment.")
                     logger.warning(f"----------------------------------------")
-                    logger.warning(f"Trying to send Segment with seq#{self._curseqnum}")
+                    logger.warning(f"Trying to send Segment with seq#{self._cur_seq_num}")
                     logger.warning(f"and payload {chunk}")
                     logger.warning(f"----------------------------------------") 
-                    self._expected_ack = self._curseqnum + datalen
-                    self._curseqnum = self._expected_ack
+                    self._expected_ack = self._cur_seq_num + datalen
+                    self._cur_seq_num = self._expected_ack
                     self._unconfirmed.put_nowait(segment)
                     self._lossy_layer.send_segment(segment)
                     logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after send")
@@ -295,7 +308,13 @@ class BTCPClientSocket(BTCPSocket):
         this project.
         """
         logger.debug("connect called")
-        self._state = BTCPStates.ESTABLISHED
+        seqnum_x = random.randint(0, 65535)
+        # [PROBLEM] implement checksum here too
+        syn_segment = self.build_segment_header(seqnum=seqnum_x, acknum=0, syn_set=True)
+        self._expected_ack = seqnum_x+1
+        self._lossy_layer.send_segment(syn_segment)
+        self._state = BTCPStates.SYN_SENT
+        # self._state = BTCPStates.ESTABLISHED
         # raise NotImplementedError("No implementation of connect present. Read the comments & code of client_socket.py.")
 
 
@@ -375,12 +394,11 @@ class BTCPClientSocket(BTCPSocket):
                 # logger.warning(f"ON SHUTDOWN: {self._unconfirmed.qsize()} segments unconfirmed")
                 # logger.warning(f"ON SHUTDOWN: {self._sendbuf.qsize()} chunks left to send")
                 # Send FIN
-                fin_segment = BTCPSocket.build_segment_header(seqnum=self._curseqnum, acknum=0, fin_set=True)
+                # [PROBLEM] no checksum yet, add pls
+                fin_segment = BTCPSocket.build_segment_header(seqnum=self._cur_seq_num, acknum=0, fin_set=True)
                 self._lossy_layer.send_segment(fin_segment)
                 self._state = BTCPStates.FIN_SENT
-                # Receive FIN/ACK
-                # Send ACK
-                # _closable = True
+                # Receive FIN/ACK, send ACK, mark as _closable (handled in network thread)
                 # Block waiting for _closable
                 while True:
                     if self._closable:
