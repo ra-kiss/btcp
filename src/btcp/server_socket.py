@@ -68,7 +68,6 @@ class BTCPServerSocket(BTCPSocket):
         # Last received
         self._lastack = None
 
-        self._accepted = False
         self._synchronized = False
 
 
@@ -247,7 +246,7 @@ class BTCPServerSocket(BTCPSocket):
                 ## Re-send SYN|ACK
                 # Check if ACK received (and correct ACK, not done here)
                 if ack_set == 1:
-                    self._state = BTCPStates.ESTABLISHED
+                    self._synchronized = True
                 ## Move to ESTABLISHED
                 pass
             case BTCPStates.ESTABLISHED:
@@ -441,8 +440,10 @@ class BTCPServerSocket(BTCPSocket):
         logger.debug("accept called")
         self._state = BTCPStates.ACCEPTING
         while True:
-            # Block waiting for _accepted (recv SYN and send SYN|ACK)
-            if self._accepted:
+            # Block waiting for _synchronized (recv final ACK)
+            logger.warning("LOCKED WAITING FOR _synchronized")
+            if self._synchronized:
+                self._state = BTCPStates.ESTABLISHED
                 break
             continue
         #raise NotImplementedError("No implementation of accept present. Read the comments & code of server_socket.py.")

@@ -57,6 +57,7 @@ class BTCPClientSocket(BTCPSocket):
 
         self._shutdownable = False
         self._closable = False
+        self._synchronized = False
         logger.info("Socket initialized with sendbuf size 1000")
 
 
@@ -129,7 +130,7 @@ class BTCPClientSocket(BTCPSocket):
                         ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+1, ack_set=True)
                         self._lossy_layer.send_segment(ack_segment)
                         self._cur_seq_num = acknum
-                        self._state = BTCPStates.ESTABLISHED
+                        self._synchronized = True
                 ### If it is, send back ACK 
                 pass
             case BTCPStates.ESTABLISHED:
@@ -314,6 +315,13 @@ class BTCPClientSocket(BTCPSocket):
         self._expected_ack = seqnum_x+1
         self._lossy_layer.send_segment(syn_segment)
         self._state = BTCPStates.SYN_SENT
+        while True:
+            # Block waiting for _synchronized (recv SYN|ACK)
+            logger.warning("LOCKED WAITING FOR _synchronized")
+            if self._synchronized:
+                self._state = BTCPStates.ESTABLISHED
+                break
+            continue
         # self._state = BTCPStates.ESTABLISHED
         # raise NotImplementedError("No implementation of connect present. Read the comments & code of client_socket.py.")
 
