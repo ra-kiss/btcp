@@ -7,6 +7,7 @@ import time
 import struct
 import logging
 import random
+import time
 
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,9 @@ class BTCPServerSocket(BTCPSocket):
         # Set default state
         self._state = BTCPStates.CLOSED
         # Last received
-        self._lastack = None
+        self._expected_ack = 1
 
         self._synchronized = False
-
 
     ###########################################################################
     ### The following section is the interface between the transport layer  ###
@@ -204,7 +204,8 @@ class BTCPServerSocket(BTCPSocket):
         logger.warning(f"window size {window} and length {length}")
         logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
         logger.warning(f"----------------------------------------")
-
+        if ack_set == 1:
+            self._state = BTCPStates.CLOSED
 
     def _other_segment_received(self, segment):
         """Helper method handling received segment in any other state
@@ -228,7 +229,7 @@ class BTCPServerSocket(BTCPSocket):
                 ## [PROBLEM] Checksum check here to be implemented :DD
                 ## Send SYN|ACK and move to SYN_RCVD
                 seqnum_y = random.randint(0, 65535)
-                syn_ack_segment = self.build_segment_header(seqnum=seqnum_y, acknum=seqnum+1, 
+                syn_ack_segment = self.build_segment_header(seqnum=seqnum_y, acknum=seqnum+1, window=self._window,
                                                             syn_set=True, ack_set=True)
                 self._lossy_layer.send_segment(syn_ack_segment)
                 self._state = BTCPStates.SYN_RCVD
@@ -258,7 +259,7 @@ class BTCPServerSocket(BTCPSocket):
                 logger.warning(f"window size {window} and length {length}")
                 logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
                 logger.warning(f"----------------------------------------")
-                logger.warning(f"seqnum {seqnum} | _lastack {self._lastack}")
+                logger.warning(f"seqnum {seqnum} | _expected_ack {self._expected_ack}")
                 data_chunk = segment[HEADER_SIZE:SEGMENT_SIZE]
                 cksm_segment = (self.build_segment_header(seqnum=seqnum, acknum=acknum, 
                                                           syn_set=True if syn_set == 1 else False,
@@ -271,31 +272,29 @@ class BTCPServerSocket(BTCPSocket):
                 logger.warning(f"==== Client internet checksum {checksum}")
                 logger.warning(f"==== Expected internet checksum {expected_checksum}")
                 logger.warning(f"==== Correct checksum? {expected_checksum == checksum}")
-                ###### [PROBLEM] THIS CODE IS IN THE WRONG PLACE DDD: NOT FOR ESTABLISHED, FOR CLOSING !!!!
                 # [PROBLEM] also need to implement checksums for fin segments
                 if fin_set == 1:
                     fin_ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum, ack_set=True, fin_set=True)
                     self._lossy_layer.send_segment(fin_ack_segment)
                     self._state = BTCPStates.CLOSING
                     return
-                # If no previous ack yet (first packet) then set to seqnum+length
-                if self._lastack == None:
-                    self._lastack = seqnum + length
-                    logger.warning(f"----------------------------------------")
-                    logger.warning(f"Trying to send return Segment with ack#{seqnum+length}")
-                    logger.warning(f"----------------------------------------") 
-                    return_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+length, length=0, ack_set=True)
-                    self._lossy_layer.send_segment(return_segment)
-                # Check if segment seq. number is previous ACK
-                if seqnum == self._lastack:
+                logger.warning(f"CORRECT SEQNUM {seqnum} == {self._expected_ack}")
+                if seqnum == self._expected_ack:
                     ## If yes, send ACK
-                    self._lastack = seqnum + length
+                    self._expected_ack = seqnum + 1
                     logger.warning(f"----------------------------------------")
-                    logger.warning(f"Trying to send return Segment with ack#{seqnum+length}")
+                    logger.warning(f"Trying to send return Segment with ack#{seqnum}")
                     logger.warning(f"----------------------------------------") 
-                    return_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+length, length=0, ack_set=True)
-                    self._lossy_layer.send_segment(return_segment)                  
-                ## If no, do nothing (? maybe some other error handling here)
+                    return_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum, length=0, ack_set=True)
+                    self._lossy_layer.send_segment(return_segment)         
+                else:         
+                    ## If no, resend last ack
+                    logger.warning(f"----------------------------------------")
+                    logger.warning(f"Trying to send problem Segment with ack#{self._expected_ack-1}")
+                    logger.warning(f"----------------------------------------") 
+                    problem_segment = self.build_segment_header(seqnum=acknum, acknum=self._expected_ack-1, length=0, ack_set=True)
+                    self._lossy_layer.send_segment(problem_segment)
+                    pass
 
                 # Check if FIN received
                 ## Send FIN|ACK
@@ -441,9 +440,10 @@ class BTCPServerSocket(BTCPSocket):
         self._state = BTCPStates.ACCEPTING
         while True:
             # Block waiting for _synchronized (recv final ACK)
-            logger.warning("LOCKED WAITING FOR _synchronized")
+            logger.debug("LOCKED WAITING FOR _synchronized")
             if self._synchronized:
                 self._state = BTCPStates.ESTABLISHED
+                logger.warning("Server moving to ESTABLISHED")  
                 break
             continue
         #raise NotImplementedError("No implementation of accept present. Read the comments & code of server_socket.py.")

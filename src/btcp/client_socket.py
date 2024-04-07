@@ -5,6 +5,8 @@ from btcp.constants import *
 import queue
 import logging
 import random
+import time
+import copy
 
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,14 @@ class BTCPClientSocket(BTCPSocket):
         # Current sequence number, acknowledgement number, and queue of unconfirmed (not ack'd) packets
         self._cur_seq_num = 1
         self._expected_ack = 0
-        self._unconfirmed = queue.Queue()
+        self._unconfirmed = queue.Queue() # Maybe to be removed, depending on how we implement go-back-n
+        self._server_rcv_window = 0
+
+        # Variables required for Go-back-N
+        self._go_back_n = 3
+        self._send_base = 1
+        self._timer = None
+        self._to_resend = queue.Queue()
 
         self._shutdownable = False
         self._closable = False
@@ -123,15 +132,18 @@ class BTCPClientSocket(BTCPSocket):
                 logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
                 logger.warning(f"window size {window} and length {length}")
                 logger.warning(f"----------------------------------------")
-                ## Check if segment contains SYN and ACK flag
+                # Check if segment contains SYN and ACK flag
                 if syn_set == 1 and ack_set == 1:
+                    # Check if ACK number is as expected
                     if acknum == self._expected_ack:
-                        ## Check if ACK number is as expected
+                        # If it is, send back ACK, set sequence number, 
+                        # confirm _synchronized and update window
                         ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+1, ack_set=True)
                         self._lossy_layer.send_segment(ack_segment)
-                        self._cur_seq_num = acknum
+                        self._cur_seq_num = 1
+                        # self._expected_ack = 1
                         self._synchronized = True
-                ### If it is, send back ACK 
+                        self._server_rcv_window = window
                 pass
             case BTCPStates.ESTABLISHED:
                 # If I receive segment from server
@@ -144,12 +156,20 @@ class BTCPClientSocket(BTCPSocket):
                 logger.warning(f"----------------------------------------")
                 ## Check if ACK set
                 if ack_set == 1:
+                    '''Not sure whether to do this here or after confirming in-order, 
+                    but since any ACK means there is now 1 more space in receive window
+                    I think it is okay to do it here'''
+                    self._server_rcv_window += 1
                     ## Check if ACK number is next-up SYN number and in-order (Maybe using Queue?)
+                    logger.warning(f"=== ACKNUM {acknum} | EXPECTED_ACK {self._expected_ack} ===")
                     if acknum == self._expected_ack:
-                        self._unconfirmed.get_nowait()
+                        if not self._unconfirmed.empty(): self._unconfirmed.get_nowait()
+                        self._send_base += 1
+                        self._expire_timers()
+                        self._start_timer()
+                        logger.warning(f"Timer reset and started")
                         logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after rcv")
                         self._shutdownable = True
-                ## If it does not contain ACK flag or contains invalid ACK number ??? 
             case BTCPStates.FIN_SENT:
                 # If I receive segment from server
                 (seqnum, acknum, syn_set, ack_set, fin_set, 
@@ -167,9 +187,9 @@ class BTCPClientSocket(BTCPSocket):
                     self._closable = True
                 ## Check if segment contains ACK but no FIN (?)
                 elif fin_set == 0 and ack_set == 1:
-                    # Handle resend :DDDDD
+                    ### If it does, register ACK
+                    # Handle resend (?)
                     pass
-                ### If it does, register ACK
                 pass
         # raise NotImplementedError("No implementation of lossy_layer_segment_received present. Read the comments & code of client_socket.py.")
 
@@ -198,7 +218,7 @@ class BTCPClientSocket(BTCPSocket):
         candidate to put in a helper method which can be called from either
         lossy_layer_segment_received or lossy_layer_tick.
         """
-        logger.debug("lossy_layer_tick called")
+        logger.warning("lossy_layer_tick called")
         match self._state:
             case BTCPStates.SYN_SENT:
                 # If I don't receive anything in SYN_SENT (check if timeout)
@@ -221,7 +241,19 @@ class BTCPClientSocket(BTCPSocket):
                 # You should be checking whether there's space in the window as well,
                 # and storing the segments for retransmission somewhere.
                 try:
+                    if self._server_rcv_window <= 0:
+                        logger.warning("No space in window, will retry sending next tick")
+                        return
+                    if not self._cur_seq_num < (self._send_base + self._go_back_n):
+                        self._expire_timers()
+                        logger.warning("Timer expired")
+                        logger.warning("Can't send segment, does not fit in Go-back-N window")
+                        logger.warning(f"Unconfirmed queue of {self._unconfirmed.qsize()}")
+                        return
                     # while True:
+                    logger.warning(f"----------------------------------------")
+                    logger.warning(f"Can send packets with seqnum between {self._send_base} and {(self._send_base+self._go_back_n)-1}")
+                    logger.warning(f"----------------------------------------")
                     logger.debug("Getting chunk from buffer.")
                     self._shutdownable = False
                     chunk = self._sendbuf.get_nowait()
@@ -237,20 +269,26 @@ class BTCPClientSocket(BTCPSocket):
                     pre_cksm_segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
                                                          acknum=0, length=datalen, checksum=0x0000)
                                 + chunk)
+                    logger.warning(f"== _cur_seq_num {self._cur_seq_num}")
                     internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
                     segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
                                                          acknum=0, length=datalen, checksum=internet_checksum)
                                 + chunk)
-                    logger.warning(f"==== Client internet checksum {internet_checksum}")
+                    self._expected_ack = self._cur_seq_num
+                    # logger.warning(f"----------------------------------------")
+                    logger.warning(f"Advertised window size of {self._server_rcv_window}")
+                    logger.warning(f"----------------------------------------")
                     logger.info("Sending segment.")
                     logger.warning(f"----------------------------------------")
-                    logger.warning(f"Trying to send Segment with seq#{self._cur_seq_num}")
+                    logger.warning(f"Trying to send Segment with seq#{self._cur_seq_num} expecting ack#{self._expected_ack}")
                     logger.warning(f"and payload {chunk}")
                     logger.warning(f"----------------------------------------") 
-                    self._expected_ack = self._cur_seq_num + datalen
-                    self._cur_seq_num = self._expected_ack
+                    self._cur_seq_num = self._expected_ack + 1
+                    logger.warning(f"Timer reset and started")
                     self._unconfirmed.put_nowait(segment)
                     self._lossy_layer.send_segment(segment)
+                    # Decrease receive window by 1 since 1 packet just sent
+                    self._server_rcv_window -= 1
                     logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after send")
                 except queue.Empty:
                     logger.info("No (more) data was available for sending right now.")
@@ -317,9 +355,10 @@ class BTCPClientSocket(BTCPSocket):
         self._state = BTCPStates.SYN_SENT
         while True:
             # Block waiting for _synchronized (recv SYN|ACK)
-            logger.warning("LOCKED WAITING FOR _synchronized")
+            logger.debug("LOCKED WAITING FOR _synchronized")
             if self._synchronized:
                 self._state = BTCPStates.ESTABLISHED
+                logger.warning("Client moving to ESTABLISHED")
                 break
             continue
         # self._state = BTCPStates.ESTABLISHED
@@ -353,7 +392,7 @@ class BTCPClientSocket(BTCPSocket):
         can carry. If a chunk is smaller we do *not* pad it here, that gets
         done later.
         """
-        logger.debug("send called")
+        logger.warning("send called")
         # raise NotImplementedError("Only rudimentary implementation of send present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
 
         # Example with a finite buffer: a queue with at most 1000 chunks,
@@ -362,7 +401,7 @@ class BTCPClientSocket(BTCPSocket):
         datalen = len(data)
         logger.debug("%i bytes passed to send", datalen)
         sent_bytes = 0
-        logger.info("Queueing data for transmission")
+        logger.debug("Queueing data for transmission")
         try:
             while sent_bytes < datalen:
                 logger.debug("Cumulative data queued: %i bytes", sent_bytes)
@@ -440,8 +479,38 @@ class BTCPClientSocket(BTCPSocket):
             self._lossy_layer.destroy()
         self._lossy_layer = None
 
+    def _start_timer(self):
+        if not self._timer:
+            logger.debug("Starting example timer.")
+            # Time in *nano*seconds, not milli- or microseconds.
+            # Using a monotonic clock ensures independence of weird stuff
+            # like leap seconds and timezone changes.
+            self._timer = time.monotonic_ns()
+        else:
+            logger.debug("Example timer already running.")
+
+
+    def _expire_timers(self):
+        curtime = time.monotonic_ns()
+        if not self._timer:
+            logger.debug("Example timer not running.")
+        elif curtime - self._timer > self._timeout * 1_000_000:
+            logger.warning("Example timer elapsed.")
+            self._timer = None
+            if self._unconfirmed.qsize() == self._go_back_n:
+                # Resend segments in _unconfirmed
+                self._to_resend = copy.copy(self._unconfirmed)
+                logger.warning(f"unconfirmed segments {self._unconfirmed.qsize()}")
+                logger.warning(f"to resend segments {self._to_resend.qsize()}")
+                self._expected_ack -= self._unconfirmed.qsize() - 1
+                for _ in range(self._unconfirmed.qsize()):
+                    segment = self._to_resend.get_nowait()
+                    if segment: logger.warning("Retrieved segment from _to_resend, attempting to send")
+                    self._lossy_layer.send_segment(segment)
+        else:
+            logger.debug("Example timer not yet elapsed.")
 
     def __del__(self):
         """Destructor. Do not modify."""
         logger.debug("__del__ called")
-        self.close()
+        self.close() 
