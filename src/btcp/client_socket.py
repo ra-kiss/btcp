@@ -64,9 +64,14 @@ class BTCPClientSocket(BTCPSocket):
         self._timer = None
         self._to_resend = queue.Queue()
 
+        self._syn_timer = None
+        self._fin_timer = None
+        self._retries = RETRIES # Hard-coded retries value
+
         self._shutdownable = False
         self._closable = False
         self._synchronized = False
+
         logger.info("Socket initialized with sendbuf size 1000")
 
 
@@ -125,74 +130,76 @@ class BTCPClientSocket(BTCPSocket):
         logger.info("Received segment.")
         match self._state:
             case BTCPStates.SYN_SENT:
-                (seqnum, acknum, syn_set, ack_set, fin_set, 
-                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
-                logger.warning(f"----------------------------------------")
-                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
-                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
-                logger.warning(f"window size {window} and length {length}")
-                logger.warning(f"----------------------------------------")
-                # Check if segment contains SYN and ACK flag
-                if syn_set == 1 and ack_set == 1:
-                    # Check if ACK number is as expected
-                    if acknum == self._expected_ack:
-                        # If it is, send back ACK, set sequence number, 
-                        # confirm _synchronized and update window
-                        ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+1, ack_set=True)
-                        self._lossy_layer.send_segment(ack_segment)
-                        self._cur_seq_num = 1
-                        # self._expected_ack = 1
-                        self._synchronized = True
-                        self._server_rcv_window = window
-                pass
+                self._syn_sent_segment_received(segment)
             case BTCPStates.ESTABLISHED:
-                # If I receive segment from server
-                (seqnum, acknum, syn_set, ack_set, fin_set, 
-                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
-                logger.warning(f"----------------------------------------")
-                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
-                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
-                logger.warning(f"window size {window} and length {length}")
-                logger.warning(f"----------------------------------------")
-                ## Check if ACK set
-                if ack_set == 1:
-                    '''Not sure whether to do this here or after confirming in-order, 
-                    but since any ACK means there is now 1 more space in receive window
-                    I think it is okay to do it here'''
-                    self._server_rcv_window += 1
-                    ## Check if ACK number is next-up SYN number and in-order (Maybe using Queue?)
-                    logger.warning(f"=== ACKNUM {acknum} | EXPECTED_ACK {self._expected_ack} ===")
-                    if acknum == self._expected_ack:
-                        if not self._unconfirmed.empty(): self._unconfirmed.get_nowait()
-                        self._send_base += 1
-                        self._expire_timers()
-                        self._start_timer()
-                        logger.warning(f"Timer reset and started")
-                        logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after rcv")
-                        self._shutdownable = True
+                self._established_segment_received(segment)
             case BTCPStates.FIN_SENT:
-                # If I receive segment from server
-                (seqnum, acknum, syn_set, ack_set, fin_set, 
-                 window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
-                logger.warning(f"----------------------------------------")
-                logger.warning(f"Segment Received with seq#{seqnum} ack#{acknum}")
-                logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
-                logger.warning(f"window size {window} and length {length}")
-                logger.warning(f"----------------------------------------")
-                ## Check if segment contains FIN and ACK flag
-                if fin_set == 1 and ack_set == 1:
-                    ### If it does, send ACK and move to BTCPStates.CLOSED
-                    final_ack_segment = self.build_segment_header(seqnum=self._cur_seq_num, acknum=0, ack_set=True)
-                    self._lossy_layer.send_segment(final_ack_segment)
-                    self._closable = True
-                ## Check if segment contains ACK but no FIN (?)
-                elif fin_set == 0 and ack_set == 1:
-                    ### If it does, register ACK
-                    # Handle resend (?)
-                    pass
-                pass
+                self._fin_sent_segment_received(segment)
         # raise NotImplementedError("No implementation of lossy_layer_segment_received present. Read the comments & code of client_socket.py.")
 
+    def _syn_sent_segment_received(self, segment):
+        (seqnum, acknum, syn_set, ack_set, fin_set, 
+        window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+        BTCPSocket.log_segment(segment, payload=False)
+        # Check if segment contains SYN and ACK flag
+        if syn_set == 1 and ack_set == 1:
+            # Check if ACK number is as expected
+            logger.warning(f"SYN ACK received, validating acknum {acknum} expected {self._expected_ack}")
+            if acknum == self._expected_ack:
+                # If it is, send back ACK, set sequence number, 
+                # confirm _synchronized and update window
+                logger.warning("SYN ACK validating, sending ACK, SYNCHRONIZED")
+                ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum+1, ack_set=True)
+                self._lossy_layer.send_segment(ack_segment)
+                self._cur_seq_num = 1
+                self._synchronized = True
+                self._server_rcv_window = window
+                # Remove syn timer, no longer needed since already synchronized
+                self._syn_timer = None
+        pass
+
+    def _established_segment_received(self, segment):
+        # If I receive segment from server
+        (seqnum, acknum, syn_set, ack_set, fin_set, 
+        window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+        BTCPSocket.log_segment(segment, payload=False)
+        ## Check if ACK set
+        if ack_set == 1:
+            '''Not sure whether to do this here or after confirming in-order, 
+            but since any ACK means there is now 1 more space in receive window
+            I think it is okay to do it here'''
+            self._server_rcv_window += 1
+            ## Check if ACK number is next-up SYN number and in-order (Maybe using Queue?)
+            logger.warning(f" >> Received acknum {acknum}")
+            logger.warning(f" >> Expected acknum {self._expected_ack}")
+            logger.warning(f" >> Correct acknum? {acknum == self._expected_ack}")
+            if acknum == self._expected_ack:
+                if not self._unconfirmed.empty(): self._unconfirmed.get_nowait()
+                self._send_base += 1
+                # Restart timers since valid ACK
+                self._expire_timer()
+                self._start_timer()
+                logger.warning(f"Timer reset and started")
+                logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after rcv")
+                self._shutdownable = True
+
+    def _fin_sent_segment_received(self, segment):
+        # If I receive segment from server
+        (seqnum, acknum, syn_set, ack_set, fin_set, 
+            window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+        BTCPSocket.log_segment(segment, payload=False)
+        ## Check if segment contains FIN and ACK flag
+        if fin_set == 1 and ack_set == 1:
+            ### If it does, send ACK and move to BTCPStates.CLOSED
+            final_ack_segment = self.build_segment_header(seqnum=self._cur_seq_num, acknum=0, ack_set=True)
+            # self._lossy_layer.send_segment(final_ack_segment)
+            self._closable = True
+        ## Check if segment contains ACK but no FIN (?)
+        elif fin_set == 0 and ack_set == 1:
+            ### If it does, register ACK
+            # Handle resend (?)
+            pass
+        pass
 
     def lossy_layer_tick(self):
         """Called by the lossy layer whenever no segment has arrived for
@@ -221,81 +228,171 @@ class BTCPClientSocket(BTCPSocket):
         logger.warning("lossy_layer_tick called")
         match self._state:
             case BTCPStates.SYN_SENT:
-                # If I don't receive anything in SYN_SENT (check if timeout)
-                ## Check if retries exceeded, if not
-                ### Re-send SYN
-                ## If yes
-                ### Move to BTCPStates.CLOSED
+                self._expire_syn_timer()
                 pass
             case BTCPStates.FIN_SENT:
-                # If I don't recieve anything in FIN_SENT (check if timeout)
-                ## Check if retries exceeded, if not
-                ### Re-send FIN
-                ## If yes
-                ### Move to BTCPStates.CLOSED
+                self._expire_fin_timer()
                 pass
             case BTCPStates.ESTABLISHED:
-                # Actually send all chunks available for sending.
-                # Relies on an eventual exception to break from the loop when no data
-                # is available.
-                # You should be checking whether there's space in the window as well,
-                # and storing the segments for retransmission somewhere.
-                try:
-                    if self._server_rcv_window <= 0:
-                        logger.warning("No space in window, will retry sending next tick")
-                        return
-                    if not self._cur_seq_num < (self._send_base + self._go_back_n):
-                        self._expire_timers()
-                        logger.warning("Timer expired")
-                        logger.warning("Can't send segment, does not fit in Go-back-N window")
-                        logger.warning(f"Unconfirmed queue of {self._unconfirmed.qsize()}")
-                        return
-                    # while True:
-                    logger.warning(f"----------------------------------------")
-                    logger.warning(f"Can send packets with seqnum between {self._send_base} and {(self._send_base+self._go_back_n)-1}")
-                    logger.warning(f"----------------------------------------")
-                    logger.debug("Getting chunk from buffer.")
-                    self._shutdownable = False
-                    chunk = self._sendbuf.get_nowait()
-                    logger.warning(f"{self._sendbuf.qsize()} chunks left in buffer")
-                    datalen = len(chunk)
-                    logger.debug("Got chunk with length %i:",
-                                    datalen)
-                    logger.debug(chunk)
-                    if datalen < PAYLOAD_SIZE:
-                        logger.debug("Padding chunk to full size")
-                        chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
-                    logger.debug("Building segment from chunk.")
-                    pre_cksm_segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
-                                                         acknum=0, length=datalen, checksum=0x0000)
-                                + chunk)
-                    logger.warning(f"== _cur_seq_num {self._cur_seq_num}")
-                    internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
-                    segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
-                                                         acknum=0, length=datalen, checksum=internet_checksum)
-                                + chunk)
-                    self._expected_ack = self._cur_seq_num
-                    # logger.warning(f"----------------------------------------")
-                    logger.warning(f"Advertised window size of {self._server_rcv_window}")
-                    logger.warning(f"----------------------------------------")
-                    logger.info("Sending segment.")
-                    logger.warning(f"----------------------------------------")
-                    logger.warning(f"Trying to send Segment with seq#{self._cur_seq_num} expecting ack#{self._expected_ack}")
-                    logger.warning(f"and payload {chunk}")
-                    logger.warning(f"----------------------------------------") 
-                    self._cur_seq_num = self._expected_ack + 1
-                    logger.warning(f"Timer reset and started")
-                    self._unconfirmed.put_nowait(segment)
-                    self._lossy_layer.send_segment(segment)
-                    # Decrease receive window by 1 since 1 packet just sent
-                    self._server_rcv_window -= 1
-                    logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after send")
-                except queue.Empty:
-                    logger.info("No (more) data was available for sending right now.")
-            # Maybe more to be added
+                self._established_tick()
+                
         # raise NotImplementedError("Only rudimentary implementation of lossy_layer_tick present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
 
+    def _established_tick(self):
+        # Actually send all chunks available for sending.
+        # Relies on an eventual exception to break from the loop when no data
+        # is available.
+        # You should be checking whether there's space in the window as well,
+        # and storing the segments for retransmission somewhere.
+        try:
+            if self._server_rcv_window <= 0:
+                logger.warning("No space in window, will retry sending next tick")
+                return
+            if not self._cur_seq_num < (self._send_base + self._go_back_n):
+                self._expire_timer()
+                logger.warning("Timer expired")
+                logger.warning("Can't send segment, does not fit in Go-back-N window")
+                logger.warning(f"Unconfirmed queue of {self._unconfirmed.qsize()}")
+                return
+            # while True:
+            logger.warning(f"----------------------------------------")
+            logger.warning(f"Can send packets with seqnum between {self._send_base} and {(self._send_base+self._go_back_n)-1}")
+            logger.warning(f"----------------------------------------")
+            logger.debug("Getting chunk from buffer.")
+            # Segment still sending, therefore not shutdownable yet
+            self._shutdownable = False
+            # Get chunk from buffer and send
+            chunk = self._sendbuf.get_nowait()
+            datalen = len(chunk)
+            logger.debug("Got chunk with length %i:",
+                            datalen)
+            logger.debug(chunk)
+            logger.debug(f"{self._sendbuf.qsize()} chunks left in buffer")
+            if datalen < PAYLOAD_SIZE:
+                logger.debug("Padding chunk to full size")
+                chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
+            logger.debug("Building segment from chunk.")
+            pre_cksm_segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
+                                                    acknum=0, length=datalen, checksum=0x0000)
+                        + chunk)
+            internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
+            segment = (self.build_segment_header(seqnum=self._cur_seq_num, 
+                                                    acknum=0, length=datalen, checksum=internet_checksum)
+                        + chunk)
+            self._expected_ack = self._cur_seq_num
+            # logger.warning(f"----------------------------------------")
+            logger.warning(f"Advertised window size of {self._server_rcv_window}")
+            logger.warning(f"----------------------------------------")
+            logger.info("Sending segment.")
+            logger.warning(f"----------------------------------------")
+            logger.warning(f"Trying to send Segment with seq#{self._cur_seq_num} expecting ack#{self._expected_ack}")
+            logger.warning(f"and payload {chunk}")
+            logger.warning(f"----------------------------------------") 
+            self._cur_seq_num = self._expected_ack + 1
+            logger.warning(f"Timer reset and started")
+            self._unconfirmed.put_nowait(segment)
+            self._lossy_layer.send_segment(segment)
+            # Decrease receive window by 1 since 1 packet just sent
+            self._server_rcv_window -= 1
+            logger.warning(f"{self._unconfirmed.qsize()} unconfirmed segments after send")
+        except queue.Empty:
+            logger.info("No (more) data was available for sending right now.")
 
+    def _start_timer(self):
+        if not self._timer:
+            logger.debug("Starting main timer.")
+            # Time in *nano*seconds, not milli- or microseconds.
+            # Using a monotonic clock ensures independence of weird stuff
+            # like leap seconds and timezone changes.
+            self._timer = time.monotonic_ns()
+        else:
+            logger.debug("Main timer already running.")
+
+    def _start_syn_timer(self):
+        if not self._syn_timer:
+            logger.debug("Starting syn timer.")
+            self._syn_timer = time.monotonic_ns()
+        else:
+            logger.debug("Syn timer already running.")
+
+    def _start_fin_timer(self):
+        if not self._fin_timer:
+            logger.debug("Starting fin timer.")
+            self._fin_timer = time.monotonic_ns()
+        else:
+            logger.debug("Fin timer already running.")
+
+
+    def _expire_timer(self):
+        curtime = time.monotonic_ns()
+        if not self._timer:
+            logger.debug("Main timer not running.")
+        elif curtime - self._timer > self._timeout * 1_000_000:
+            logger.debug("Main timer elapsed.")
+            self._timer = None
+            if self._unconfirmed.qsize() == self._go_back_n:
+                # Resend segments in _unconfirmed
+                self._to_resend = copy.copy(self._unconfirmed)
+                logger.warning(f"unconfirmed segments {self._unconfirmed.qsize()}")
+                logger.warning(f"to resend segments {self._to_resend.qsize()}")
+                self._expected_ack -= self._unconfirmed.qsize() - 1
+                for _ in range(self._unconfirmed.qsize()):
+                    segment = self._to_resend.get_nowait()
+                    if segment: logger.warning("Retrieved segment from _to_resend, attempting to send")
+                    self._lossy_layer.send_segment(segment)
+        else:
+            logger.debug("Main timer not yet elapsed.")
+
+    def _expire_syn_timer(self):
+        curtime = time.monotonic_ns()
+        if not self._syn_timer:
+            logger.debug("Syn timer not running.")
+        elif curtime - self._syn_timer > (self._timeout*2) * 1_000_000:
+            logger.warning("Syn timer elapsed.")
+            self._syn_timer = None
+            # If I don't receive anything in SYN_SENT (timeout)
+            ## Check if retries exceeded, if not
+            if self._retries > 0:
+                ### Re-send SYN
+                seqnum_x = random.randint(0, 65535)
+                # [PROBLEM] implement checksum here too
+                syn_segment = self.build_segment_header(seqnum=seqnum_x, acknum=0, syn_set=True)
+                BTCPSocket.log_segment(syn_segment, received=False)
+                self._expected_ack = seqnum_x+1
+                self._lossy_layer.send_segment(syn_segment)
+                self._retries -= 1
+                self._start_syn_timer()
+            ## If yes
+            else:
+                ### Move to BTCPStates.CLOSED
+                self._state = BTCPStates.CLOSED
+        else:
+            logger.debug("Syn timer not yet elapsed.")
+    
+    def _expire_fin_timer(self):
+        curtime = time.monotonic_ns()
+        if not self._fin_timer:
+            logger.debug("Fin timer not running.")
+        elif curtime - self._fin_timer > (self._timeout*2) * 1_000_000:
+            logger.debug("Fin timer elapsed.")
+            self._fin_timer = None
+            # If I don't recieve anything in FIN_SENT (check if timeout)
+            ## Check if retries exceeded, if not
+            if self._retries > 0:
+                ### Re-send FIN
+                # [PROBLEM] implement checksum here too
+                fin_segment = BTCPSocket.build_segment_header(seqnum=self._cur_seq_num, acknum=0, fin_set=True)
+                BTCPSocket.log_segment(fin_segment, received=False)
+                self._lossy_layer.send_segment(fin_segment)
+                self._retries -= 1
+                self._start_fin_timer()
+            ## If yes
+            else:
+                ### Move to BTCPStates.CLOSED
+                self._state = BTCPStates.CLOSED
+                
+        else:
+            logger.debug("Fin timer not yet elapsed.")
 
     ###########################################################################
     ### You're also building the socket API for the applications to use.    ###
@@ -348,16 +445,23 @@ class BTCPClientSocket(BTCPSocket):
         """
         logger.debug("connect called")
         seqnum_x = random.randint(0, 65535)
+        # while True:
+            # continue
         # [PROBLEM] implement checksum here too
         syn_segment = self.build_segment_header(seqnum=seqnum_x, acknum=0, syn_set=True)
         self._expected_ack = seqnum_x+1
+        logger.warning(f"Expected ack {self._expected_ack}")
         self._lossy_layer.send_segment(syn_segment)
+        self._expire_syn_timer()
+        self._start_syn_timer()
         self._state = BTCPStates.SYN_SENT
         while True:
             # Block waiting for _synchronized (recv SYN|ACK)
             logger.debug("LOCKED WAITING FOR _synchronized")
             if self._synchronized:
                 self._state = BTCPStates.ESTABLISHED
+                # Reset retries since connection succesful
+                self._retries = RETRIES
                 logger.warning("Client moving to ESTABLISHED")
                 break
             continue
@@ -445,6 +549,7 @@ class BTCPClientSocket(BTCPSocket):
                 fin_segment = BTCPSocket.build_segment_header(seqnum=self._cur_seq_num, acknum=0, fin_set=True)
                 self._lossy_layer.send_segment(fin_segment)
                 self._state = BTCPStates.FIN_SENT
+                self._start_fin_timer()
                 # Receive FIN/ACK, send ACK, mark as _closable (handled in network thread)
                 # Block waiting for _closable
                 while True:
@@ -478,37 +583,6 @@ class BTCPClientSocket(BTCPSocket):
         if self._lossy_layer is not None:
             self._lossy_layer.destroy()
         self._lossy_layer = None
-
-    def _start_timer(self):
-        if not self._timer:
-            logger.debug("Starting example timer.")
-            # Time in *nano*seconds, not milli- or microseconds.
-            # Using a monotonic clock ensures independence of weird stuff
-            # like leap seconds and timezone changes.
-            self._timer = time.monotonic_ns()
-        else:
-            logger.debug("Example timer already running.")
-
-
-    def _expire_timers(self):
-        curtime = time.monotonic_ns()
-        if not self._timer:
-            logger.debug("Example timer not running.")
-        elif curtime - self._timer > self._timeout * 1_000_000:
-            logger.warning("Example timer elapsed.")
-            self._timer = None
-            if self._unconfirmed.qsize() == self._go_back_n:
-                # Resend segments in _unconfirmed
-                self._to_resend = copy.copy(self._unconfirmed)
-                logger.warning(f"unconfirmed segments {self._unconfirmed.qsize()}")
-                logger.warning(f"to resend segments {self._to_resend.qsize()}")
-                self._expected_ack -= self._unconfirmed.qsize() - 1
-                for _ in range(self._unconfirmed.qsize()):
-                    segment = self._to_resend.get_nowait()
-                    if segment: logger.warning("Retrieved segment from _to_resend, attempting to send")
-                    self._lossy_layer.send_segment(segment)
-        else:
-            logger.debug("Example timer not yet elapsed.")
 
     def __del__(self):
         """Destructor. Do not modify."""

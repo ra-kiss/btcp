@@ -159,3 +159,14 @@ class BTCPSocket:
         logger.debug("unpack_segment_header() done")
         return seqnum, acknum, syn_set, ack_set, fin_set, window, length, checksum
         # raise NotImplementedError("No implementation of unpack_segment_header present. Read the comments & code of btcp_socket.py. You should really implement the packing / unpacking of the header into field values before doing anything else!")
+
+    @staticmethod
+    def log_segment(segment, payload=True, received=True):
+        (seqnum, acknum, syn_set, ack_set, fin_set, 
+            window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
+        logger.warning(f"----------------------------------------")
+        logger.warning(f"Segment {'Received' if received else 'Sent'} with seq#{seqnum} ack#{acknum}")
+        logger.warning(f"syn?{syn_set} ack?{ack_set} fin?{fin_set}")
+        logger.warning(f"window size {window} and length {length}")
+        if payload: logger.warning(f"and payload {segment[HEADER_SIZE:-1]}")
+        logger.warning(f"----------------------------------------")
