@@ -355,8 +355,11 @@ class BTCPClientSocket(BTCPSocket):
             if self._retries > 0:
                 ### Re-send SYN
                 seqnum_x = random.randint(0, 65535)
-                # [PROBLEM] implement checksum here too
-                syn_segment = self.build_segment_header(seqnum=seqnum_x, acknum=0, syn_set=True)
+                pre_cksm_segment = (self.build_segment_header(seqnum=seqnum_x, acknum=0,
+                                                    syn_set=True, checksum=0x0000))
+                internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
+                syn_segment = self.build_segment_header(seqnum=seqnum_x, acknum=0, 
+                                                    syn_set=True, checksum=internet_checksum)
                 BTCPSocket.log_segment(syn_segment, received=False)
                 self._expected_ack = seqnum_x+1
                 self._lossy_layer.send_segment(syn_segment)
@@ -380,8 +383,11 @@ class BTCPClientSocket(BTCPSocket):
             ## Check if retries exceeded, if not
             if self._retries > 0:
                 ### Re-send FIN
-                # [PROBLEM] implement checksum here too
-                fin_segment = BTCPSocket.build_segment_header(seqnum=self._cur_seq_num, acknum=0, fin_set=True)
+                pre_cksm_segment = (self.build_segment_header(seqnum=self._cur_seq_num, acknum=0,
+                                                    fin_set=True, checksum=0x0000))
+                internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
+                fin_segment = BTCPSocket.build_segment_header(seqnum=self._cur_seq_num, acknum=0,
+                                                    fin_set=True, checksum=internet_checksum)
                 BTCPSocket.log_segment(fin_segment, received=False)
                 self._lossy_layer.send_segment(fin_segment)
                 self._retries -= 1
@@ -445,10 +451,11 @@ class BTCPClientSocket(BTCPSocket):
         """
         logger.debug("connect called")
         seqnum_x = random.randint(0, 65535)
-        # while True:
-            # continue
-        # [PROBLEM] implement checksum here too
-        syn_segment = self.build_segment_header(seqnum=seqnum_x, acknum=0, syn_set=True)
+        pre_cksm_segment = (self.build_segment_header(seqnum=seqnum_x, acknum=0,
+                                                    syn_set=True, checksum=0x0000))
+        internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
+        syn_segment = self.build_segment_header(seqnum=seqnum_x, acknum=0, 
+                                            syn_set=True, checksum=internet_checksum)
         self._expected_ack = seqnum_x+1
         logger.warning(f"Expected ack {self._expected_ack}")
         self._lossy_layer.send_segment(syn_segment)
@@ -542,11 +549,12 @@ class BTCPClientSocket(BTCPSocket):
         while True:
             # Check if both queues are empty
             if self._unconfirmed.empty() and self._sendbuf.empty() and self._shutdownable:
-                # logger.warning(f"ON SHUTDOWN: {self._unconfirmed.qsize()} segments unconfirmed")
-                # logger.warning(f"ON SHUTDOWN: {self._sendbuf.qsize()} chunks left to send")
                 # Send FIN
-                # [PROBLEM] no checksum yet, add pls
-                fin_segment = BTCPSocket.build_segment_header(seqnum=self._cur_seq_num, acknum=0, fin_set=True)
+                pre_cksm_segment = (self.build_segment_header(seqnum=self._cur_seq_num, acknum=0,
+                                                    fin_set=True, checksum=0x0000))
+                internet_checksum = BTCPSocket.in_cksum(pre_cksm_segment)
+                fin_segment = BTCPSocket.build_segment_header(seqnum=self._cur_seq_num, acknum=0, 
+                                                    fin_set=True, checksum=internet_checksum)
                 self._lossy_layer.send_segment(fin_segment)
                 self._state = BTCPStates.FIN_SENT
                 self._start_fin_timer()

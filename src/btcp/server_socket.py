@@ -75,6 +75,7 @@ class BTCPServerSocket(BTCPSocket):
         self._syn_rcvd_timer = None
 
         self._syn_rcvd_ack = None
+        self._acknum_y = None
 
         self._retries = RETRIES
 
@@ -186,28 +187,38 @@ class BTCPServerSocket(BTCPSocket):
         """Helper method handling received segment in accepting state
         """
         logger.debug("_accepting_segment_received called")
-        # Check if SYN received
         (seqnum, acknum, syn_set, ack_set, fin_set, 
             window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
         BTCPSocket.log_segment(segment, payload=False)
-        ## [PROBLEM] Checksum check here to be implemented
-        ## Send SYN|ACK and move to SYN_RCVD
-        seqnum_y = random.randint(0, 65535)
-        self._syn_rcvd_ack = seqnum+1
-        syn_ack_segment = self.build_segment_header(seqnum=seqnum_y, acknum=self._syn_rcvd_ack, window=self._window,
-                                                    syn_set=True, ack_set=True)
-        self._lossy_layer.send_segment(syn_ack_segment)
-        self._state = BTCPStates.SYN_RCVD
-        self._start_syn_rcvd_timer()
+        cksm_segment = (self.build_segment_header(seqnum=seqnum, acknum=acknum, 
+                                                    syn_set=True if syn_set == 1 else False,
+                                                    ack_set=True if ack_set == 1 else False,
+                                                    fin_set=True if fin_set == 1 else False,
+                                                    window=window, length=length, checksum=0x0000))
+        # logger.warning(segment)
+        expected_checksum = BTCPSocket.in_cksum(cksm_segment)
+        # Check if SYN received and checksum correct
+        if syn_set == 1 and expected_checksum == checksum:
+            ## Send SYN|ACK and move to SYN_RCVD
+            seqnum_y = random.randint(0, 65535)
+            self._syn_rcvd_ack = seqnum+1
+            self._acknum_y = seqnum_y+1 # Store expected acknowledgement for when receiving ACK
+            syn_ack_segment = self.build_segment_header(seqnum=seqnum_y, acknum=self._syn_rcvd_ack, window=self._window,
+                                                        syn_set=True, ack_set=True)
+            self._lossy_layer.send_segment(syn_ack_segment)
+            self._state = BTCPStates.SYN_RCVD
+            self._start_syn_rcvd_timer()
     
     def _syn_rcvd_segment_received(self, segment):
         (seqnum, acknum, syn_set, ack_set, fin_set, 
         window, length, checksum) = BTCPSocket.unpack_segment_header(segment[0:HEADER_SIZE])
         BTCPSocket.log_segment(segment, payload=False)
         # Check if SYN received again OR timeout (timeout handled in lossy_layer_tick)
-        ## Re-send SYN|ACK
-        # Check if ACK received (and correct ACK, not done here)
-        if ack_set == 1:
+        if syn_set == 1:
+            ## Re-send SYN|ACK
+            pass
+        # Check if ACK received and correct ACK
+        if ack_set == 1 and acknum == self._acknum_y:
             self._synchronized = True
         ## Move to ESTABLISHED (handled in the locking loop)
         pass
@@ -228,16 +239,18 @@ class BTCPServerSocket(BTCPSocket):
         logger.warning(f" >> Received internet checksum {checksum}")
         logger.warning(f" >> Expected internet checksum {expected_checksum}")
         logger.warning(f" >> Correct checksum? {expected_checksum == checksum}")
-        # [PROBLEM] also need to implement checksums for fin segments
         # Check if FIN received
         if fin_set == 1:
-            ## Send FIN|ACK
-            fin_ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum, ack_set=True, fin_set=True)
-            BTCPSocket.log_segment(fin_ack_segment, payload=False, received=False)
-            self._lossy_layer.send_segment(fin_ack_segment)
-            self._state = BTCPStates.CLOSING
-            self._start_closing_timer()
-            return
+            ## Send FIN|ACK if checksum is correct
+            if expected_checksum == checksum:
+                fin_ack_segment = self.build_segment_header(seqnum=acknum, acknum=seqnum, ack_set=True, fin_set=True)
+                BTCPSocket.log_segment(fin_ack_segment, payload=False, received=False)
+                self._lossy_layer.send_segment(fin_ack_segment)
+                self._state = BTCPStates.CLOSING
+                self._start_closing_timer()
+            # Do not continue from this
+            # Even if checksum is wrong it is not necessary
+            return 
         # Check if sequence number is correct
         logger.warning(f" >> Received seqnum {seqnum}")
         logger.warning(f" >> Expected seqnum {self._expected_seq_num}")
@@ -371,6 +384,7 @@ class BTCPServerSocket(BTCPSocket):
             self._syn_rcvd_timer = None
             if self._retries > 0:
                 seqnum_y = random.randint(0, 65535)
+                self._acknum_y = seqnum_y+1
                 syn_ack_segment = self.build_segment_header(seqnum=seqnum_y, acknum=self._syn_rcvd_ack, window=self._window,
                                                             syn_set=True, ack_set=True)
                 BTCPSocket.log_segment(syn_ack_segment, received=False)
